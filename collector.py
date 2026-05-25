@@ -11,8 +11,8 @@ HF_TOKEN       = os.environ["HF_TOKEN"]
 HF_DATASET     = os.environ["HF_DATASET_REPO"]   # e.g. "yourname/es-volume-data"
 BASE_URL       = "https://data.infoway.io"
 SYM            = "ES1!"
-POLL_INTERVAL  = 60          # seconds between each Infoway poll
-WRITE_INTERVAL = 300         # seconds between each HF dataset write (5 min)
+POLL_INTERVAL  = 20          # seconds between each Infoway poll
+WRITE_INTERVAL = 30         # seconds between each HF dataset write (5 min)
 RUN_DURATION   = 6 * 3600    # 6 hours total runtime in seconds
 
 HEADERS = {
