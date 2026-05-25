@@ -1,0 +1,29 @@
+name: ES Volume Collector
+
+on:
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      DATA_API_KEY: ${{ secrets.DATA_API_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests huggingface_hub
+
+      - name: Run collector
+        run: python collector.py
