@@ -5,156 +5,215 @@ import os
 from datetime import datetime, timezone
 from huggingface_hub import HfApi
 
-# ── Config ──────────────────────────────────────────────────
-API_KEY        = os.environ["DATA_API_KEY"]
-HF_TOKEN       = os.environ["HF_TOKEN"]
-HF_DATASET     = os.environ["HF_DATASET_REPO"]   # e.g. "yourname/es-volume-data"
-BASE_URL       = "https://data.infoway.io"
-SYM            = "ES1!"
-POLL_INTERVAL  = 20          # seconds between each Infoway poll
-WRITE_INTERVAL = 30         # seconds between each HF dataset write (5 min)
-RUN_DURATION   = 6 * 3600    # 6 hours total runtime in seconds
+# ── Config ───────────────────────────────────────────────────
+API_KEY       = os.environ["DATA_API_KEY"]
+HF_TOKEN      = os.environ["HF_TOKEN"]
+HF_DATASET    = os.environ["HF_DATASET_REPO"]   # e.g. "yourname/es-volume-data"
+BASE_URL      = "https://data.infoway.io"
+SYM           = "ES1!"
+POLL_INTERVAL = 10        # seconds between each time-check loop
+RUN_DURATION  = 6 * 3600  # 6 hours
 
-HEADERS = {
+HEADERS_JSON = {
     "apiKey": API_KEY,
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
+HEADERS_GET = {
+    "apiKey": API_KEY,
+    "Accept": "application/json"
+}
 
 api = HfApi(token=HF_TOKEN)
 
-# ── Helpers ──────────────────────────────────────────────────
-def fetch_kline(kline_type, kline_num):
+# ── Time helpers ─────────────────────────────────────────────
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def last_closed_bar_ts():
+    """
+    Returns the unix timestamp of the last fully closed M1 bar.
+    If current time is 12:58:47 → returns timestamp for 12:57:00.
+    A bar closes when the next minute starts.
+    We subtract one extra second as safety buffer.
+    """
+    now  = int(time.time())
+    current_minute = (now // 60) * 60
+    return current_minute - 60
+
+def ts_to_str(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# ── Fetch exactly one closed M1 bar by timestamp ─────────────
+def fetch_closed_bar(bar_ts):
+    """
+    Fetches the M1 bar that closed at bar_ts.
+    Uses timestamp param so Infoway anchors to that exact point.
+    Returns the bar dict or None.
+    """
     try:
         r = requests.post(
             f"{BASE_URL}/common/v2/batch_kline",
-            headers=HEADERS,
-            json={"klineType": kline_type, "klineNum": kline_num, "codes": SYM},
+            headers=HEADERS_JSON,
+            json={
+                "klineType": 1,          # M1
+                "klineNum":  3,          # fetch 3, pick the one we want
+                "codes":     SYM,
+                "timestamp": bar_ts + 59 # anchor just before bar close
+            },
             timeout=10
         )
         data = r.json()
-        if data.get("ret") == 200:
-            return data["data"][0]["respList"]
-    except Exception as e:
-        print(f"  kline error: {e}")
-    return []
+        if data.get("ret") != 200:
+            print(f"  ⚠️  kline ret={data.get('ret')} msg={data.get('msg')}")
+            return None
 
-def fetch_depth():
+        bars = data["data"][0]["respList"]
+        # Find the bar whose timestamp matches exactly
+        for b in bars:
+            if int(b["t"]) == bar_ts:
+                return b
+
+        # If exact match not found, take the closest bar <= bar_ts
+        candidates = [b for b in bars if int(b["t"]) <= bar_ts]
+        if candidates:
+            return max(candidates, key=lambda x: int(x["t"]))
+
+        return None
+
+    except Exception as e:
+        print(f"  ❌ fetch_closed_bar error: {e}")
+        return None
+
+# ── Load existing bars from HF dataset ───────────────────────
+def load_existing():
+    """
+    Loads latest.json from HF dataset.
+    Returns the m1_bars list and last_ts we already have.
+    """
     try:
-        r = requests.get(
-            f"{BASE_URL}/common/batch_depth/{SYM}",
-            headers={"apiKey": API_KEY, "Accept": "application/json"},
-            timeout=10
-        )
-        data = r.json()
-        if data.get("ret") == 200:
-            return data["data"][0]
+        url = f"https://huggingface.co/datasets/{HF_DATASET}/resolve/main/latest.json"
+        r   = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            bars = data.get("m1_bars", [])
+            print(f"  Loaded {len(bars)} existing bars from HF dataset.")
+            return bars
+        else:
+            print(f"  No existing data found (HTTP {r.status_code}). Starting fresh.")
+            return []
     except Exception as e:
-        print(f"  depth error: {e}")
-    return None
+        print(f"  Could not load existing data: {e}. Starting fresh.")
+        return []
 
-def fetch_last_trade():
-    try:
-        r = requests.get(
-            f"{BASE_URL}/common/batch_trade/{SYM}",
-            headers={"apiKey": API_KEY, "Accept": "application/json"},
-            timeout=10
-        )
-        data = r.json()
-        if data.get("ret") == 200:
-            return data["data"][0]
-    except Exception as e:
-        print(f"  trade error: {e}")
-    return None
+# ── Build M5 bars from M1 bars ────────────────────────────────
+def build_m5(m1_bars):
+    """
+    Aggregates M1 bars into M5 bars.
+    Groups by floor(timestamp / 300) * 300.
+    """
+    buckets = {}
+    for b in m1_bars:
+        t      = int(b["t"])
+        bucket = (t // 300) * 300
+        if bucket not in buckets:
+            buckets[bucket] = []
+        buckets[bucket].append(b)
 
-def write_to_hf(m1_bars, m5_bars, depth_snap, last_trade):
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    print(f"  Writing to HF dataset at {ts}...")
+    m5_bars = []
+    for bucket_ts in sorted(buckets.keys()):
+        group = buckets[bucket_ts]
+        m5_bars.append({
+            "t":  str(bucket_ts),
+            "o":  group[0]["o"],
+            "h":  str(max(float(b["h"]) for b in group)),
+            "l":  str(min(float(b["l"]) for b in group)),
+            "c":  group[-1]["c"],
+            "v":  str(sum(float(b["v"]) for b in group)),
+            "vw": str(sum(float(b["vw"]) for b in group)),
+        })
 
+    return m5_bars
+
+# ── Write to HF dataset ───────────────────────────────────────
+def write_to_hf(m1_bars):
+    m5_bars = build_m5(m1_bars)
     payload = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "symbol": SYM,
-        "m1": m1_bars,
-        "m5": m5_bars,
-        "depth": depth_snap,
-        "last_trade": last_trade
+        "updated_at": now_utc().isoformat(),
+        "symbol":     SYM,
+        "m1_bars":    m1_bars,
+        "m5_bars":    m5_bars,
     }
-
-    # Write as a single JSON file — the HF space reads this
     json_bytes = json.dumps(payload, indent=2).encode("utf-8")
-
     try:
         api.upload_file(
             path_or_fileobj=json_bytes,
             path_in_repo="latest.json",
             repo_id=HF_DATASET,
             repo_type="dataset",
-            commit_message=f"update {ts}"
+            commit_message=f"bar {ts_to_str(int(m1_bars[-1]['t']))}"
         )
-        print(f"  ✅ Written latest.json ({len(json_bytes)//1024}KB)")
+        print(f"  ✅ HF updated — {len(m1_bars)} M1 bars, {len(m5_bars)} M5 bars")
     except Exception as e:
         print(f"  ❌ HF write failed: {e}")
 
-# ── Main loop ────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────
 def main():
-    start      = time.time()
-    last_write = 0
+    start = time.time()
+    print(f"Collector started at {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"Symbol: {SYM} | Poll every {POLL_INTERVAL}s | Run for {RUN_DURATION//3600}h\n")
 
-    print(f"Collector started. Will run for {RUN_DURATION//3600}h.")
-    print(f"Polling every {POLL_INTERVAL}s, writing to HF every {WRITE_INTERVAL}s.")
+    # Load whatever bars we already have so we don't lose history on restart
+    m1_bars = load_existing()
 
-    # Accumulators — keep last 500 bars of each in memory
-    m1_bars    = []
-    m5_bars    = []
-    depth_snap = None
-    last_trade = None
+    # Track the timestamp of the last bar we successfully stored
+    last_stored_ts = int(m1_bars[-1]["t"]) if m1_bars else 0
 
     while True:
         elapsed = time.time() - start
         if elapsed >= RUN_DURATION:
-            print("6-hour limit reached. Exiting.")
+            print("6-hour limit reached. Final write...")
+            if m1_bars:
+                write_to_hf(m1_bars)
+            print("Done.")
             break
 
-        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"[{now}] Polling Infoway...")
+        now_str    = now_utc().strftime("%H:%M:%S UTC")
+        target_ts  = last_closed_bar_ts()
 
-        # Fetch M1 — last 500 bars
-        time.sleep(1.1)
-        raw_m1 = fetch_kline(kline_type=1, kline_num=500)
-        if raw_m1:
-            m1_bars = raw_m1
-            print(f"  M1: {len(m1_bars)} bars, last v={m1_bars[-1].get('v')}")
+        print(f"[{now_str}] Last closed bar should be: {ts_to_str(target_ts)}")
 
-        # Fetch M5 — last 500 bars
-        time.sleep(1.1)
-        raw_m5 = fetch_kline(kline_type=2, kline_num=500)
-        if raw_m5:
-            m5_bars = raw_m5
-            print(f"  M5: {len(m5_bars)} bars, last v={m5_bars[-1].get('v')}")
+        if target_ts <= last_stored_ts:
+            # No new closed bar yet — current minute still forming
+            print(f"  → Already have this bar. Waiting for next close.")
+        else:
+            # New bar has closed — fetch it
+            print(f"  → New bar detected! Fetching...")
+            time.sleep(1.2)   # rate limit buffer
+            bar = fetch_closed_bar(target_ts)
 
-        # Fetch depth
-        time.sleep(1.1)
-        d = fetch_depth()
-        if d:
-            depth_snap = d
-            print(f"  Depth: bid={d['b'][0][0] if d.get('b') else '?'}")
+            if bar:
+                actual_ts = int(bar["t"])
+                print(f"  → Got bar: t={ts_to_str(actual_ts)} "
+                      f"o={bar['o']} h={bar['h']} l={bar['l']} "
+                      f"c={bar['c']} v={bar['v']}")
 
-        # Fetch last trade
-        time.sleep(1.1)
-        lt = fetch_last_trade()
-        if lt:
-            last_trade = lt
-            print(f"  Last trade: p={lt.get('p')} v={lt.get('v')}")
+                # Only append if this timestamp is truly new
+                if actual_ts > last_stored_ts:
+                    m1_bars.append(bar)
+                    last_stored_ts = actual_ts
 
-        # Write to HF every WRITE_INTERVAL seconds
-        if (time.time() - last_write) >= WRITE_INTERVAL:
-            write_to_hf(m1_bars, m5_bars, depth_snap, last_trade)
-            last_write = time.time()
+                    # Keep last 500 bars in memory to avoid huge JSON
+                    if len(m1_bars) > 500:
+                        m1_bars = m1_bars[-500:]
 
-        # Sleep until next poll (minus the ~4.4s already spent on 4 requests)
-        sleep_remaining = max(0, POLL_INTERVAL - 4.4)
-        print(f"  Sleeping {sleep_remaining:.0f}s...")
-        time.sleep(sleep_remaining)
+                    write_to_hf(m1_bars)
+                else:
+                    print(f"  → Bar timestamp {actual_ts} not newer than {last_stored_ts}. Skipping.")
+            else:
+                print(f"  → Bar not available yet. Will retry next poll.")
+
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
