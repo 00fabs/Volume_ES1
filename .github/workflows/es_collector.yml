@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests huggingface_hub
+        run: pip install websocket-client huggingface_hub
 
       - name: Run collector
         run: python collector.py
