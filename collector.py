@@ -19,18 +19,18 @@ WS_URL = f"wss://data.infoway.io/ws?business=common&apikey={API_KEY}"
 api    = HfApi(token=HF_TOKEN)
 
 # ── Shared state ─────────────────────────────────────────────
-lock           = threading.Lock()
-m1_closed      = []
-live_bar       = {}
-last_closed_ts = 0
-last_live_write= 0
-start_time     = time.time()
+lock             = threading.Lock()
+m1_closed        = []
+live_bar         = {}
+last_closed_ts   = 0
+start_time       = time.time()
+depth_history    = deque(maxlen=5)
+bar_price_levels = {}
 
-# Depth history — keep last 5 snapshots for signal computation
-depth_history  = deque(maxlen=5)
-
-# Per-bar volume accumulator (reset on bar close)
-bar_trade_vol  = 0.0
+# HF throttle
+last_hf_commit   = 0
+MIN_COMMIT_GAP   = 45
+pending_commit   = False
 
 # ── Helpers ──────────────────────────────────────────────────
 def now_utc():
@@ -41,188 +41,130 @@ def ts_to_eat(ts):
         int(ts) + 3*3600, tz=timezone.utc
     ).strftime("%Y-%m-%d %H:%M:%S EAT")
 
-def build_m5(m1_bars):
+def aggregate_poc(bars_in_group):
+    """
+    Re-aggregates price_levels across a group of M1 bars
+    to find the true POC for M5/M15.
+    """
+    combined = {}
+    for b in bars_in_group:
+        pl = b.get("price_levels", {})
+        for price_str, vol in pl.items():
+            combined[price_str] = combined.get(price_str, 0) + vol
+    if not combined:
+        return None, None
+    poc_price = max(combined, key=combined.get)
+    poc_vol   = combined[poc_price]
+    return float(poc_price), round(poc_vol, 0)
+
+def build_tf(m1_bars, bucket_seconds, label):
+    """Generic builder for M5 (300s) and M15 (900s)."""
     buckets = {}
     for b in m1_bars:
         t      = int(b["t"])
-        bucket = (t // 300) * 300
+        bucket = (t // bucket_seconds) * bucket_seconds
         if bucket not in buckets:
             buckets[bucket] = []
         buckets[bucket].append(b)
-    m5 = []
+
+    result = []
     for bts in sorted(buckets):
-        g = buckets[bts]
-        m5.append({
-            "t":      str(bts),
-            "o":      g[0]["o"],
-            "h":      str(max(float(x["h"]) for x in g)),
-            "l":      str(min(float(x["l"]) for x in g)),
-            "c":      g[-1]["c"],
-            "v":      str(sum(float(x["v"]) for x in g)),
-            "vw":     str(sum(float(x["vw"]) for x in g)),
-            "signal": _merge_m5_signal([x.get("signal","none") for x in g]),
-            "signal_detail": g[-1].get("signal_detail", {}),
+        g         = buckets[bts]
+        poc_price, poc_vol = aggregate_poc(g)
+        result.append({
+            "t":          str(bts),
+            "o":          g[0]["o"],
+            "h":          str(max(float(x["h"]) for x in g)),
+            "l":          str(min(float(x["l"]) for x in g)),
+            "c":          g[-1]["c"],
+            "v":          str(sum(float(x["v"]) for x in g)),
+            "vw":         str(sum(float(x["vw"]) for x in g)),
+            "poc_price":  poc_price,
+            "poc_vol":    poc_vol,
         })
-    return m5
-
-def _merge_m5_signal(signals):
-    # If any bar in M5 group has a signal, propagate it
-    if "absorption" in signals:
-        return "absorption"
-    if "continuation_bull" in signals:
-        return "continuation_bull"
-    if "continuation_bear" in signals:
-        return "continuation_bear"
-    return "none"
-
-# ── Signal computation ───────────────────────────────────────
-def compute_signal(closed_bar, m1_bars_so_far, depth_hist):
-    """
-    Runs on every bar close.
-    Returns signal string and detail dict.
-    """
-    if len(m1_bars_so_far) < 5 or len(depth_hist) < 3:
-        return "none", {}
-
-    o = float(closed_bar["o"])
-    h = float(closed_bar["h"])
-    l = float(closed_bar["l"])
-    c = float(closed_bar["c"])
-    v = float(closed_bar["v"])
-
-    bar_range = h - l
-    if bar_range == 0:
-        return "none", {}
-
-    body_pct  = abs(c - o) / bar_range          # 0=doji 1=full body
-    close_pct = (c - l) / bar_range             # 0=closed at low 1=at high
-
-    # Average volume of last 20 closed bars
-    lookback  = m1_bars_so_far[-20:]
-    avg_vol   = sum(float(b["v"]) for b in lookback) / len(lookback)
-    vol_ratio = v / avg_vol if avg_vol > 0 else 0
-
-    # Depth snapshot analysis
-    snaps     = list(depth_hist)[-3:]            # last 3 snapshots
-    imbalances= [s["imbalance"] for s in snaps]
-    ask_sizes = [s["ask_size"]  for s in snaps]
-    bid_sizes = [s["bid_size"]  for s in snaps]
-
-    # Imbalance trend
-    imb_now   = imbalances[-1]
-    imb_prev  = imbalances[0]
-    imb_flipped_bull = imb_prev < 0 and imb_now > 0
-    imb_consistently_bull = all(i >= 15 for i in imbalances)
-    imb_consistently_bear = all(i <= -15 for i in imbalances)
-
-    # Ask consumption (bull absorption / continuation)
-    ask_depleted = False
-    ask_refilled = False
-    if len(ask_sizes) >= 3 and ask_sizes[0] > 0:
-        ask_drop_pct = (ask_sizes[0] - ask_sizes[1]) / ask_sizes[0]
-        ask_depleted = ask_drop_pct >= 0.40
-        ask_refilled = ask_sizes[2] > ask_sizes[1]
-
-    # Bid consumption (bear continuation)
-    bid_depleted = False
-    if len(bid_sizes) >= 3 and bid_sizes[0] > 0:
-        bid_drop_pct = (bid_sizes[0] - bid_sizes[1]) / bid_sizes[0]
-        bid_depleted = bid_drop_pct >= 0.40
-
-    detail = {
-        "vol_ratio":    round(vol_ratio, 2),
-        "body_pct":     round(body_pct,  2),
-        "close_pct":    round(close_pct, 2),
-        "imb_now":      round(imb_now,   1),
-        "imb_prev":     round(imb_prev,  1),
-        "ask_depleted": ask_depleted,
-        "ask_refilled": ask_refilled,
-        "bid_depleted": bid_depleted,
-        "avg_vol":      round(avg_vol,   0),
-    }
-
-    # ── Absorption reversal ──────────────────────────────────
-    # High volume + doji/small body + imbalance flipped bull
-    # + ask absorbed and refilled (passive seller was overwhelmed)
-    if (vol_ratio  >= 1.5
-    and body_pct   <= 0.30
-    and imb_flipped_bull
-    and ask_depleted
-    and ask_refilled):
-        return "absorption", detail
-
-    # ── Bullish continuation ─────────────────────────────────
-    # High volume + closed near high + persistent bull imbalance
-    # + ask being consumed (no refill = price moving up through it)
-    if (vol_ratio  >= 1.3
-    and close_pct  >= 0.70
-    and imb_consistently_bull
-    and ask_depleted
-    and not ask_refilled):
-        return "continuation_bull", detail
-
-    # ── Bearish continuation ─────────────────────────────────
-    # High volume + closed near low + persistent bear imbalance
-    # + bid being consumed
-    if (vol_ratio  >= 1.3
-    and close_pct  <= 0.30
-    and imb_consistently_bear
-    and bid_depleted):
-        return "continuation_bear", detail
-
-    return "none", detail
+    return result
 
 # ── HF upload ────────────────────────────────────────────────
-def _upload(filename, payload, msg):
-    try:
-        data = json.dumps(payload, indent=2).encode("utf-8")
-        api.upload_file(
-            path_or_fileobj=data,
-            path_in_repo=filename,
-            repo_id=HF_DATASET,
-            repo_type="dataset",
-            commit_message=msg,
-        )
-    except Exception as e:
-        print(f"  [{now_utc()}] ❌ HF {filename}: {e}")
+def write_to_hf(reason="bar_close"):
+    global last_hf_commit, pending_commit
 
-def write_closed_bars():
+    now = time.time()
+    if now - last_hf_commit < MIN_COMMIT_GAP:
+        pending_commit = True
+        wait = int(MIN_COMMIT_GAP - (now - last_hf_commit))
+        print(f"  [{now_utc()}] ⏳ Throttled — retry in {wait}s")
+        return
+
     with lock:
         bars = list(m1_closed)
+        live = dict(live_bar)
+        snap = list(depth_history)[-1] if depth_history else {}
+
     if not bars:
         return
-    m5 = build_m5(bars)
+
+    m5  = build_tf(bars, 300, "M5")
+    m15 = build_tf(bars, 900, "M15")
+
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "symbol":     SYM,
         "m1_bars":    bars,
         "m5_bars":    m5,
-    }
-    _upload("latest.json", payload,
-            f"close {ts_to_eat(bars[-1]['t'])}")
-    sig = bars[-1].get("signal", "none")
-    print(f"  [{now_utc()}] ✅ latest.json — "
-          f"{len(bars)} M1 bars | last signal={sig}")
-
-def write_live_bar():
-    with lock:
-        bar  = dict(live_bar)
-        snap = list(depth_history)[-1] if depth_history else {}
-    if not bar:
-        return
-    payload = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "symbol":     SYM,
-        "live_bar":   bar,
+        "m15_bars":   m15,
+        "live_bar":   live,
         "live_depth": snap,
     }
-    _upload("live.json", payload, "live")
 
+    try:
+        data = json.dumps(payload, indent=2).encode("utf-8")
+        api.upload_file(
+            path_or_fileobj=data,
+            path_in_repo="data.json",
+            repo_id=HF_DATASET,
+            repo_type="dataset",
+            commit_message=f"{reason} {ts_to_eat(bars[-1]['t'])}",
+        )
+        last_hf_commit = time.time()
+        pending_commit = False
+        print(f"  [{now_utc()}] ✅ data.json — "
+              f"{len(bars)} M1 | {len(m5)} M5 | {len(m15)} M15")
+    except Exception as e:
+        print(f"  [{now_utc()}] ❌ HF failed: {e}")
+        last_hf_commit = time.time()
+
+def throttle_watchdog():
+    global pending_commit
+    while True:
+        time.sleep(10)
+        if pending_commit:
+            if time.time() - last_hf_commit >= MIN_COMMIT_GAP:
+                print(f"  [{now_utc()}] 🔄 Retry pending commit...")
+                threading.Thread(
+                    target=write_to_hf,
+                    args=("retry",),
+                    daemon=True
+                ).start()
+
+# ── Heartbeat ────────────────────────────────────────────────
+def send_heartbeat(ws):
+    while True:
+        time.sleep(20)
+        try:
+            ws.send(json.dumps({
+                "code":  0,
+                "trace": uuid.uuid4().hex,
+                "data":  {}
+            }))
+        except Exception:
+            break
+
+# ── Load existing ────────────────────────────────────────────
 def load_existing_bars():
     try:
         import urllib.request
         url = (f"https://huggingface.co/datasets/"
-               f"{HF_DATASET}/resolve/main/latest.json")
+               f"{HF_DATASET}/resolve/main/data.json")
         with urllib.request.urlopen(url, timeout=10) as r:
             data = json.loads(r.read())
         bars = data.get("m1_bars", [])
@@ -236,7 +178,10 @@ def load_existing_bars():
 def on_open(ws):
     print(f"[{now_utc()}] ✅ Connected")
 
-    # Kline M1
+    threading.Thread(
+        target=send_heartbeat, args=(ws,), daemon=True
+    ).start()
+
     ws.send(json.dumps({
         "code":  10006,
         "trace": uuid.uuid4().hex,
@@ -244,21 +189,20 @@ def on_open(ws):
     }))
     time.sleep(1)
 
-    # Depth
     ws.send(json.dumps({
         "code":  10003,
         "trace": uuid.uuid4().hex,
         "data":  {"codes": SYM}
     }))
-    print(f"[{now_utc()}] → Subscribed kline M1 + depth")
+    print(f"[{now_utc()}] → Subscribed M1 kline + depth + heartbeat")
 
 def on_message(ws, raw):
-    global last_closed_ts, last_live_write
+    global last_closed_ts
 
     data = json.loads(raw)
     code = data.get("code")
 
-    # ── Depth push ───────────────────────────────────────────
+    # ── Depth ────────────────────────────────────────────────
     if code == 10005:
         d = data["data"]
         try:
@@ -268,23 +212,34 @@ def on_message(ws, raw):
             bid_sz = float(d["b"][1][0]) if d.get("b") else 0
             total  = ask_sz + bid_sz
             imb    = ((bid_sz - ask_sz) / total * 100) if total > 0 else 0
-            snap = {
-                "t":         int(time.time()),
-                "ask_price": ask_px,
-                "ask_size":  ask_sz,
-                "bid_price": bid_px,
-                "bid_size":  bid_sz,
-                "imbalance": round(imb, 1),
-                "spread":    round(ask_px - bid_px, 2),
-            }
             with lock:
-                depth_history.append(snap)
+                depth_history.append({
+                    "t":         int(time.time()),
+                    "ask_price": ask_px,
+                    "ask_size":  ask_sz,
+                    "bid_price": bid_px,
+                    "bid_size":  bid_sz,
+                    "imbalance": round(imb, 1),
+                    "spread":    round(ask_px - bid_px, 2),
+                })
         except Exception:
             pass
 
-    # ── Kline push ───────────────────────────────────────────
+    # ── Trade — POC accumulation ─────────────────────────────
+    elif code == 10002:
+        d = data["data"]
+        try:
+            price = str(round(float(d["p"]) * 4) / 4)
+            vol   = float(d["v"])
+            with lock:
+                bar_price_levels[price] = \
+                    bar_price_levels.get(price, 0) + vol
+        except Exception:
+            pass
+
+    # ── Kline ────────────────────────────────────────────────
     elif code == 10008:
-        d  = data["data"]
+        d = data["data"]
         if d.get("ty") != 1:
             return
 
@@ -303,51 +258,59 @@ def on_message(ws, raw):
             current_live_ts = int(live_bar.get("t", 0))
 
             if bar_ts > current_live_ts:
-                # Previous bar just closed
-                if current_live_ts > 0 and current_live_ts > last_closed_ts:
-                    closed        = dict(live_bar)
-                    existing_ts   = {int(b["t"]) for b in m1_closed}
+                if current_live_ts > 0 and \
+                   current_live_ts > last_closed_ts:
+
+                    closed      = dict(live_bar)
+                    existing_ts = {int(b["t"]) for b in m1_closed}
 
                     if current_live_ts not in existing_ts:
-                        # Compute signal on close
-                        sig, detail = compute_signal(
-                            closed, m1_closed, depth_history
-                        )
-                        closed["signal"]        = sig
-                        closed["signal_detail"] = detail
+                        # Store full price levels for M5/M15 POC aggregation
+                        closed["price_levels"] = dict(bar_price_levels)
+
+                        # POC for M1 display
+                        if bar_price_levels:
+                            poc_p = max(
+                                bar_price_levels,
+                                key=bar_price_levels.get
+                            )
+                            closed["poc_price"] = float(poc_p)
+                            closed["poc_vol"]   = round(
+                                bar_price_levels[poc_p], 0
+                            )
+                        else:
+                            closed["poc_price"] = None
+                            closed["poc_vol"]   = None
+
+                        bar_price_levels.clear()
                         m1_closed.append(closed)
                         if len(m1_closed) > 500:
                             m1_closed.pop(0)
 
                     last_closed_ts = current_live_ts
-                    s = closed.get("signal", "none")
+                    poc = closed.get("poc_price", "?")
                     print(f"  [{now_utc()}] 🔒 CLOSED "
                           f"{ts_to_eat(current_live_ts)} "
-                          f"v={closed['v']} signal={s}")
+                          f"v={closed['v']} poc={poc}")
 
                     threading.Thread(
-                        target=write_closed_bars, daemon=True
+                        target=write_to_hf,
+                        args=("bar_close",),
+                        daemon=True
                     ).start()
 
                 live_bar.clear()
                 live_bar.update(bar)
-
             else:
                 live_bar.update(bar)
 
-        now = time.time()
-        if now - last_live_write >= 10:
-            last_live_write = now
-            threading.Thread(
-                target=write_live_bar, daemon=True
-            ).start()
-
-    elif code == 10007:
-        print(f"  [{now_utc()}] ✅ Kline sub confirmed")
-    elif code == 10004:
-        print(f"  [{now_utc()}] ✅ Depth sub confirmed")
+    elif code in (10007, 10004):
+        label = "Kline" if code == 10007 else "Depth"
+        print(f"  [{now_utc()}] ✅ {label} sub confirmed")
     elif code == 200:
         print(f"  [{now_utc()}] 🟢 {data.get('msg')}")
+    elif code == 0:
+        pass  # heartbeat ack
 
 def on_error(ws, error):
     print(f"[{now_utc()}] ❌ {error}")
@@ -370,20 +333,22 @@ def run_with_reconnect():
         if time.time() - start_time < RUN_DURATION:
             print(f"[{now_utc()}] Reconnecting in 5s...")
             time.sleep(5)
-    print(f"[{now_utc()}] Run complete.")
+    print(f"[{now_utc()}] 6h complete.")
 
 # ── Main ─────────────────────────────────────────────────────
 def main():
     global m1_closed
-    print(f"ES Collector — WebSocket + Signals")
+    print(f"ES Collector — WebSocket + POC")
     print(f"Symbol: {SYM} | {RUN_DURATION//3600}h\n")
     existing = load_existing_bars()
     with lock:
         m1_closed.extend(existing)
+    threading.Thread(
+        target=throttle_watchdog, daemon=True
+    ).start()
     run_with_reconnect()
     print(f"[{now_utc()}] Final write...")
-    write_closed_bars()
-    write_live_bar()
+    write_to_hf("session_end")
 
 if __name__ == "__main__":
     main()
